@@ -48,8 +48,9 @@ BASE_CSS = """
   h1, h2, h3 { margin: 0 0 10px; }
   p { margin: 0 0 10px; color: #444; }
   label { font-weight: 700; display: block; margin-top: 10px; margin-bottom: 6px; }
-  input[type="text"], input[type="file"], select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 12px; background: #fff; }
+  input[type="text"], input[type="number"], input[type="file"], select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 12px; background: #fff; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
   .errorBox { border: 1px solid #f3b6b6; background: #fff3f3; padding: 12px; border-radius: 12px; }
   .okBox { border: 1px solid #bfe6c8; background: #f3fff6; padding: 12px; border-radius: 12px; }
   table { width: 100%; border-collapse: collapse; margin-top: 10px; }
@@ -57,12 +58,12 @@ BASE_CSS = """
   th { background: #fafafa; }
   .muted { color: #777; font-size: 12px; }
   .nav { display: inline-flex; gap: 8px; flex-wrap: wrap; }
-  .kpi { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .kpi { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; }
   .kpi .box { background: #fff; border: 1px solid #eee; border-radius: 16px; padding: 14px; }
   .kpi .label { font-size: 12px; color: #666; margin-bottom: 6px; }
-  .kpi .value { font-size: 22px; font-weight: 800; }
+  .kpi .value { font-size: 20px; font-weight: 800; }
   .right { text-align: right; }
-  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } .kpi { grid-template-columns: 1fr; } }
+  @media (max-width: 900px) { .grid3 { grid-template-columns: 1fr; } .kpi { grid-template-columns: 1fr; } .grid2 { grid-template-columns: 1fr; } }
 </style>
 """
 
@@ -90,17 +91,10 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
-def column_exists(conn, table: str, column: str) -> bool:
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    return column in cols
-
 def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # Cria imports (lotes)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS imports (
       batch_id TEXT PRIMARY KEY,
@@ -113,52 +107,8 @@ def init_db():
     )
     """)
 
-    # Detecta se transactions existe e se tem batch_id
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
-    exists = cur.fetchone() is not None
-
-    if not exists:
-        cur.execute("""
-        CREATE TABLE transactions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          batch_id TEXT NOT NULL,
-          month_ref TEXT NOT NULL,
-          uploaded_by TEXT NOT NULL,
-          dt_text TEXT,
-          estabelecimento TEXT,
-          categoria TEXT,
-          valor REAL NOT NULL,
-          tipo TEXT NOT NULL,
-          dono TEXT NOT NULL,
-          rateio TEXT NOT NULL,
-          observacao TEXT,
-          parcela TEXT,
-          created_at TEXT NOT NULL
-        )
-        """)
-        conn.commit()
-        conn.close()
-        return
-
-    # Se existe, checa colunas
-    cur.execute("PRAGMA table_info(transactions)")
-    cols = [r[1] for r in cur.fetchall()]
-    has_batch_id = "batch_id" in cols
-
-    if has_batch_id:
-        conn.commit()
-        conn.close()
-        return
-
-    # Migração: tabela antiga sem batch_id
-    now = dt.datetime.utcnow().isoformat(timespec="seconds")
-
-    # Renomeia tabela antiga
-    cur.execute("ALTER TABLE transactions RENAME TO transactions_old")
-
-    # Cria tabela nova
     cur.execute("""
-    CREATE TABLE transactions (
+    CREATE TABLE IF NOT EXISTS transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       batch_id TEXT NOT NULL,
       month_ref TEXT NOT NULL,
@@ -176,35 +126,19 @@ def init_db():
     )
     """)
 
-    # Para cada mês e perfil antigos, cria um batch legacy importado e copia linhas
     cur.execute("""
-      SELECT month_ref, uploaded_by, COUNT(*) as cnt
-      FROM transactions_old
-      GROUP BY month_ref, uploaded_by
+    CREATE TABLE IF NOT EXISTS incomes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      month_ref TEXT NOT NULL,
+      profile TEXT NOT NULL,
+      salario_1 REAL NOT NULL DEFAULT 0,
+      salario_2 REAL NOT NULL DEFAULT 0,
+      extras REAL NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(month_ref, profile)
+    )
     """)
-    groups = cur.fetchall()
-
-    for g in groups:
-        month_ref = g[0]
-        uploaded_by = g[1]
-        cnt = int(g[2])
-        batch_id = uuid.uuid4().hex
-
-        cur.execute("""
-          INSERT INTO imports (batch_id, month_ref, uploaded_by, filename, row_count, status, created_at)
-          VALUES (?, ?, ?, ?, ?, 'imported', ?)
-        """, (batch_id, month_ref, uploaded_by, "legacy_migration", cnt, now))
-
-        cur.execute("""
-          INSERT INTO transactions
-          (batch_id, month_ref, uploaded_by, dt_text, estabelecimento, categoria, valor, tipo, dono, rateio, observacao, parcela, created_at)
-          SELECT ?, month_ref, uploaded_by, dt_text, estabelecimento, categoria, valor, tipo, dono, rateio, observacao, parcela, created_at
-          FROM transactions_old
-          WHERE month_ref = ? AND uploaded_by = ?
-        """, (batch_id, month_ref, uploaded_by))
-
-    # Drop tabela antiga
-    cur.execute("DROP TABLE transactions_old")
 
     conn.commit()
     conn.close()
@@ -220,6 +154,8 @@ def topbar_html(profile: str):
           <a class="btn" href="{url_for('upload')}">Upload</a>
           <a class="btn" href="{url_for('imports_list')}">Importações</a>
           <a class="btn" href="{url_for('casa')}">Casa</a>
+          <a class="btn" href="{url_for('individual')}">Individual</a>
+          <a class="btn" href="{url_for('renda')}">Renda</a>
           <a class="btn" href="{url_for('home')}">Trocar perfil</a>
         </div>
         """
@@ -279,7 +215,6 @@ def validate_transactions(df: pd.DataFrame):
         if rateio not in ALLOWED_RATEIO:
             errors.append(f"Linha {line_number}: Rateio inválido, use 60_40, 50_50, 100_meu ou 100_outro")
 
-        # Regras Dono x Rateio
         if rateio in {"60_40", "50_50"} and dono != "Casa":
             errors.append(f"Linha {line_number}: Rateio {rateio} exige Dono Casa")
 
@@ -383,12 +318,18 @@ def delete_batch(batch_id: str, profile: str) -> tuple[bool, str]:
     return True, "Importação excluída"
 
 def signed_value(tipo: str, valor: float) -> float:
-    # Saida soma, Entrada subtrai
     if tipo == "Entrada":
         return -abs(valor)
     return abs(valor)
 
-def fetch_house_transactions(month_ref: str):
+def share_for(profile: str, rateio: str) -> float:
+    if rateio == "50_50":
+        return 0.5
+    if rateio == "60_40":
+        return LUCAS_SHARE if profile == "Lucas" else RAFA_SHARE
+    return 0.0
+
+def fetch_imported_transactions(month_ref: str):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
@@ -397,8 +338,6 @@ def fetch_house_transactions(month_ref: str):
       JOIN imports i ON i.batch_id = t.batch_id
       WHERE t.month_ref = ?
         AND i.status = 'imported'
-        AND t.dono = 'Casa'
-        AND t.rateio IN ('60_40','50_50')
       ORDER BY t.id ASC
     """, (month_ref,))
     rows = cur.fetchall()
@@ -406,7 +345,8 @@ def fetch_house_transactions(month_ref: str):
     return rows
 
 def compute_casa(month_ref: str):
-    rows = fetch_house_transactions(month_ref)
+    rows_all = fetch_imported_transactions(month_ref)
+    rows = [r for r in rows_all if r["dono"] == "Casa" and r["rateio"] in ("60_40", "50_50")]
 
     total_casa = 0.0
     paid_lucas = 0.0
@@ -414,7 +354,6 @@ def compute_casa(month_ref: str):
     expected_lucas = 0.0
     expected_rafa = 0.0
 
-    # categoria -> {total, lucas_paid, rafa_paid}
     by_category = {}
 
     for r in rows:
@@ -456,7 +395,6 @@ def compute_casa(month_ref: str):
     cats_sorted = sorted(by_category.items(), key=lambda x: x[1]["total"], reverse=True)
 
     return {
-        "rows": rows,
         "total_casa": total_casa,
         "paid_lucas": paid_lucas,
         "paid_rafa": paid_rafa,
@@ -465,6 +403,113 @@ def compute_casa(month_ref: str):
         "settlement_text": settlement_text,
         "settlement_value": settlement_value,
         "cats_sorted": cats_sorted,
+    }
+
+def get_income(month_ref: str, profile: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT salario_1, salario_2, extras
+      FROM incomes
+      WHERE month_ref = ? AND profile = ?
+    """, (month_ref, profile))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"salario_1": 0.0, "salario_2": 0.0, "extras": 0.0, "total": 0.0}
+    s1 = float(row["salario_1"] or 0)
+    s2 = float(row["salario_2"] or 0)
+    ex = float(row["extras"] or 0)
+    return {"salario_1": s1, "salario_2": s2, "extras": ex, "total": s1 + s2 + ex}
+
+def upsert_income(month_ref: str, profile: str, salario_1: float, salario_2: float, extras: float):
+    now = dt.datetime.utcnow().isoformat(timespec="seconds")
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+      SELECT id FROM incomes WHERE month_ref = ? AND profile = ?
+    """, (month_ref, profile))
+    exists = cur.fetchone() is not None
+
+    if exists:
+        cur.execute("""
+          UPDATE incomes
+          SET salario_1 = ?, salario_2 = ?, extras = ?, updated_at = ?
+          WHERE month_ref = ? AND profile = ?
+        """, (salario_1, salario_2, extras, now, month_ref, profile))
+    else:
+        cur.execute("""
+          INSERT INTO incomes (month_ref, profile, salario_1, salario_2, extras, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (month_ref, profile, salario_1, salario_2, extras, now, now))
+
+    conn.commit()
+    conn.close()
+
+def compute_individual(month_ref: str, profile: str):
+    rows = fetch_imported_transactions(month_ref)
+
+    house_by_cat = {}
+    house_total = 0.0
+
+    my_personal_by_cat = {}
+    my_personal_total = 0.0
+
+    receivable_by_cat = {}
+    receivable_total = 0.0
+
+    payable_by_cat = {}
+    payable_total = 0.0
+
+    for r in rows:
+        val = signed_value(r["tipo"], r["valor"])
+        cat = r["categoria"] or "Sem categoria"
+
+        if r["dono"] == "Casa" and r["rateio"] in ("60_40", "50_50"):
+            sh = share_for(profile, r["rateio"])
+            part = val * sh
+            house_total += part
+            house_by_cat[cat] = house_by_cat.get(cat, 0.0) + part
+            continue
+
+        if r["rateio"] == "100_meu" and r["uploaded_by"] == profile and r["dono"] == profile:
+            my_personal_total += val
+            my_personal_by_cat[cat] = my_personal_by_cat.get(cat, 0.0) + val
+            continue
+
+        if r["rateio"] == "100_outro" and r["uploaded_by"] == profile and r["dono"] != "Casa" and r["dono"] != profile:
+            receivable_total += val
+            receivable_by_cat[cat] = receivable_by_cat.get(cat, 0.0) + val
+            continue
+
+        if r["rateio"] == "100_outro" and r["uploaded_by"] != profile and r["dono"] == profile:
+            payable_total += val
+            payable_by_cat[cat] = payable_by_cat.get(cat, 0.0) + val
+            continue
+
+    income = get_income(month_ref, profile)
+
+    expenses_effective = house_total + my_personal_total + payable_total
+    sobra = income["total"] - expenses_effective
+
+    cats_house = sorted(house_by_cat.items(), key=lambda x: x[1], reverse=True)
+    cats_personal = sorted(my_personal_by_cat.items(), key=lambda x: x[1], reverse=True)
+    cats_recv = sorted(receivable_by_cat.items(), key=lambda x: x[1], reverse=True)
+    cats_pay = sorted(payable_by_cat.items(), key=lambda x: x[1], reverse=True)
+
+    return {
+        "income": income,
+        "house_total": house_total,
+        "my_personal_total": my_personal_total,
+        "receivable_total": receivable_total,
+        "payable_total": payable_total,
+        "expenses_effective": expenses_effective,
+        "sobra": sobra,
+        "cats_house": cats_house,
+        "cats_personal": cats_personal,
+        "cats_recv": cats_recv,
+        "cats_pay": cats_pay,
     }
 
 def year_month_select_html(selected_year: str, selected_month: str):
@@ -477,6 +522,28 @@ def year_month_select_html(selected_year: str, selected_month: str):
         for m in range(1, 13)
     ])
     return year_options, month_options
+
+def month_selector_block(selected_year: str, selected_month: str, action_url: str):
+    year_options, month_options = year_month_select_html(selected_year, selected_month)
+    month_ref = month_ref_from(selected_year, selected_month)
+    return f"""
+      <form method="get" action="{action_url}">
+        <div class="grid2">
+          <div>
+            <label>Ano</label>
+            <select name="Ano">{year_options}</select>
+          </div>
+          <div>
+            <label>Mês</label>
+            <select name="Mes">{month_options}</select>
+          </div>
+        </div>
+        <p class="muted" style="margin-top:10px;">Mês de referência: <b>{month_ref}</b></p>
+        <div class="row" style="justify-content:flex-start; margin-top:10px;">
+          <button class="btn btnPrimary" type="submit">Atualizar</button>
+        </div>
+      </form>
+    """
 
 @app.route("/")
 def home():
@@ -522,6 +589,11 @@ def dashboard():
     if not profile:
         return redirect(url_for("home"))
 
+    now_y, now_m = current_year_month()
+    default_year = request.args.get("Ano") or "2026"
+    default_month = request.args.get("Mes") or f"{now_m:02d}"
+    month_ref = month_ref_from(default_year, default_month)
+
     html = f"""
     <!doctype html>
     <html lang="pt-br">
@@ -536,11 +608,12 @@ def dashboard():
         <div class="wrap">
           <div class="card">
             <h2>Painel do {profile}</h2>
-            <p>Upload gera preview automaticamente. Depois você importa e vê Casa.</p>
-            <div class="row" style="justify-content:flex-start;">
-              <a class="btn btnPrimary" href="{url_for('upload')}">Ir para Upload</a>
-              <a class="btn" href="{url_for('imports_list')}">Ver Importações</a>
-              <a class="btn" href="{url_for('casa')}">Ver Casa</a>
+            <p class="muted">Sugestão: preencha Renda e depois abra Individual.</p>
+            {month_selector_block(default_year, default_month, url_for('dashboard'))}
+            <div class="row" style="justify-content:flex-start; margin-top:12px;">
+              <a class="btn btnPrimary" href="{url_for('renda')}?Ano={default_year}&Mes={default_month}">Abrir Renda</a>
+              <a class="btn btnPrimary" href="{url_for('individual')}?Ano={default_year}&Mes={default_month}">Abrir Individual</a>
+              <a class="btn" href="{url_for('casa')}?month_ref={month_ref}">Abrir Casa</a>
             </div>
           </div>
         </div>
@@ -569,9 +642,6 @@ def upload():
     imported_msg = ""
     imported_ok = False
 
-    # Ações:
-    # - POST com file -> cria preview batch
-    # - POST com action=import -> finaliza import do batch_id
     action = request.form.get("action", "")
 
     if request.method == "POST" and action == "import":
@@ -581,7 +651,6 @@ def upload():
         imported_msg = msg
 
     elif request.method == "POST":
-        # Preview: precisa de file
         if not (selected_year.isdigit() and len(selected_year) == 4):
             errors.append("Ano inválido")
         if not (selected_month.isdigit() and len(selected_month) == 2 and 1 <= int(selected_month) <= 12):
@@ -595,11 +664,8 @@ def upload():
             try:
                 df = read_excel_from_upload(file)
                 errors, preview_rows = validate_transactions(df)
-
                 if not errors:
-                    # cria preview batch e salva as linhas já no banco como preview
                     batch_id = create_preview_batch(month_ref, profile, file.filename, preview_rows)
-
             except Exception as e:
                 errors.append(str(e))
 
@@ -627,6 +693,7 @@ def upload():
               <div class="row" style="justify-content:flex-start; margin-top:10px;">
                 <a class="btn btnPrimary" href="{url_for('casa')}?month_ref={month_ref}">Abrir Casa</a>
                 <a class="btn" href="{url_for('imports_list')}?month_ref={month_ref}">Ver Importações</a>
+                <a class="btn" href="{url_for('individual')}?Ano={selected_year}&Mes={selected_month}">Ver Individual</a>
               </div>
             </div>
           </div>
@@ -699,12 +766,8 @@ def upload():
               <label>Arquivo Excel</label>
               <input id="fileInput" type="file" name="file" accept=".xlsx,.xls" />
 
-              <p class="muted" style="margin-top:12px;">
-                Ao escolher o arquivo, o preview abre automaticamente.
-              </p>
-              <p class="muted">
-                Colunas obrigatórias: {", ".join(REQUIRED_COLUMNS)}
-              </p>
+              <p class="muted" style="margin-top:12px;">Ao escolher o arquivo, o preview abre automaticamente.</p>
+              <p class="muted">Colunas obrigatórias: {", ".join(REQUIRED_COLUMNS)}</p>
             </form>
           </div>
 
@@ -753,8 +816,6 @@ def imports_list():
 
     conn = get_db()
     cur = conn.cursor()
-
-    # Mostrar imports do mês (todos), mas com delete só nos meus
     cur.execute("""
       SELECT * FROM imports
       WHERE month_ref = ?
@@ -864,7 +925,6 @@ def casa():
     month_ref = request.args.get("month_ref") or f"{default_year}{default_month}"
 
     data = compute_casa(month_ref)
-
     settle_line = f"{data['settlement_text']}: {brl(data['settlement_value'])}"
 
     cats_rows = ""
@@ -877,7 +937,6 @@ def casa():
             <td class="right">{brl(obj["rafa"])}</td>
           </tr>
         """
-
     if not cats_rows:
         cats_rows = "<tr><td colspan='4' class='muted'>Sem lançamentos importados de Casa para esse mês</td></tr>"
 
@@ -896,7 +955,7 @@ def casa():
 
           <div class="card">
             <h2>Casa</h2>
-            <p>Mostrando somente Dono Casa, com rateio 60_40 e 50_50 (somente batches importados).</p>
+            <p>Mostrando somente Dono Casa com rateio 60_40 e 50_50, somente batches importados.</p>
             <form method="get">
               <label>Mês de referência</label>
               <input type="text" name="month_ref" value="{month_ref}" placeholder="202602" />
@@ -925,6 +984,11 @@ def casa():
                 <div class="value">{brl(data["paid_rafa"])}</div>
                 <div class="muted">Deveria: {brl(data["expected_rafa"])}</div>
               </div>
+              <div class="box">
+                <div class="label">Acerto</div>
+                <div class="value">{brl(data["settlement_value"])}</div>
+                <div class="muted">{data["settlement_text"]}</div>
+              </div>
             </div>
 
             <div style="margin-top:12px;" class="okBox">
@@ -935,7 +999,7 @@ def casa():
 
           <div class="card">
             <h3>Casa por categoria</h3>
-            <p class="muted">Aqui já aparece o total por categoria e quanto cada um pagou dentro daquela categoria.</p>
+            <p class="muted">Total por categoria e quanto cada um pagou dentro daquela categoria.</p>
             <table>
               <thead>
                 <tr>
@@ -948,6 +1012,230 @@ def casa():
               <tbody>
                 {cats_rows}
               </tbody>
+            </table>
+          </div>
+
+        </div>
+      </body>
+    </html>
+    """
+    return html
+
+@app.route("/renda", methods=["GET", "POST"])
+def renda():
+    profile = session.get("profile", "")
+    if not profile:
+        return redirect(url_for("home"))
+
+    now_y, now_m = current_year_month()
+    selected_year = request.values.get("Ano") or "2026"
+    selected_month = request.values.get("Mes") or f"{now_m:02d}"
+    month_ref = month_ref_from(selected_year, selected_month)
+
+    msg = ""
+    msg_ok = True
+
+    if request.method == "POST":
+        def num(v):
+            try:
+                v = str(v).replace(".", "").replace(",", ".")
+                return float(v) if v else 0.0
+            except:
+                return 0.0
+
+        s1 = num(request.form.get("salario_1"))
+        s2 = num(request.form.get("salario_2"))
+        ex = num(request.form.get("extras"))
+        upsert_income(month_ref, profile, s1, s2, ex)
+        msg = "Renda salva"
+        msg_ok = True
+
+    inc = get_income(month_ref, profile)
+
+    msg_block = ""
+    if msg:
+        klass = "okBox" if msg_ok else "errorBox"
+        msg_block = f"""
+          <div class="card">
+            <div class="{klass}">
+              <b>{msg}</b>
+            </div>
+          </div>
+        """
+
+    html = f"""
+    <!doctype html>
+    <html lang="pt-br">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Renda</title>
+        {BASE_CSS}
+      </head>
+      <body>
+        {topbar_html(profile)}
+        <div class="wrap">
+          <div class="card">
+            <h2>Renda do {profile}</h2>
+            {month_selector_block(selected_year, selected_month, url_for('renda'))}
+          </div>
+
+          <div class="card">
+            <h3>Valores do mês</h3>
+            <form method="post">
+              <input type="hidden" name="Ano" value="{selected_year}">
+              <input type="hidden" name="Mes" value="{selected_month}">
+
+              <div class="grid3">
+                <div>
+                  <label>Salário 1</label>
+                  <input type="text" name="salario_1" value="{inc['salario_1']:.2f}" />
+                </div>
+                <div>
+                  <label>Salário 2</label>
+                  <input type="text" name="salario_2" value="{inc['salario_2']:.2f}" />
+                </div>
+                <div>
+                  <label>Extras</label>
+                  <input type="text" name="extras" value="{inc['extras']:.2f}" />
+                </div>
+              </div>
+
+              <div class="row" style="justify-content:flex-start; margin-top:12px;">
+                <button class="btn btnPrimary" type="submit">Salvar</button>
+                <a class="btn" href="{url_for('individual')}?Ano={selected_year}&Mes={selected_month}">Ver Individual</a>
+              </div>
+
+              <p class="muted" style="margin-top:10px;">Total do mês: <b>{brl(inc['total'])}</b></p>
+            </form>
+          </div>
+
+          {msg_block}
+        </div>
+      </body>
+    </html>
+    """
+    return html
+
+@app.route("/individual", methods=["GET"])
+def individual():
+    profile = session.get("profile", "")
+    if not profile:
+        return redirect(url_for("home"))
+
+    now_y, now_m = current_year_month()
+    selected_year = request.args.get("Ano") or "2026"
+    selected_month = request.args.get("Mes") or f"{now_m:02d}"
+    month_ref = month_ref_from(selected_year, selected_month)
+
+    data = compute_individual(month_ref, profile)
+
+    def rows_from(items):
+        out = ""
+        for cat, val in items:
+            out += f"<tr><td>{cat}</td><td class='right'>{brl(val)}</td></tr>"
+        if not out:
+            out = "<tr><td colspan='2' class='muted'>Sem dados</td></tr>"
+        return out
+
+    html = f"""
+    <!doctype html>
+    <html lang="pt-br">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Individual</title>
+        {BASE_CSS}
+      </head>
+      <body>
+        {topbar_html(profile)}
+        <div class="wrap">
+          <div class="card">
+            <h2>Individual do {profile}</h2>
+            {month_selector_block(selected_year, selected_month, url_for('individual'))}
+            <div class="row" style="justify-content:flex-start; margin-top:12px;">
+              <a class="btn btnPrimary" href="{url_for('renda')}?Ano={selected_year}&Mes={selected_month}">Editar Renda</a>
+              <a class="btn" href="{url_for('casa')}?month_ref={month_ref}">Ver Casa</a>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Resumo</h3>
+            <div class="kpi">
+              <div class="box">
+                <div class="label">Renda total</div>
+                <div class="value">{brl(data["income"]["total"])}</div>
+              </div>
+              <div class="box">
+                <div class="label">Minha parte da casa</div>
+                <div class="value">{brl(data["house_total"])}</div>
+              </div>
+              <div class="box">
+                <div class="label">Meu pessoal</div>
+                <div class="value">{brl(data["my_personal_total"])}</div>
+              </div>
+              <div class="box">
+                <div class="label">A pagar para o outro</div>
+                <div class="value">{brl(data["payable_total"])}</div>
+              </div>
+            </div>
+
+            <div class="kpi" style="margin-top:12px;">
+              <div class="box">
+                <div class="label">A receber do outro</div>
+                <div class="value">{brl(data["receivable_total"])}</div>
+              </div>
+              <div class="box">
+                <div class="label">Gastos efetivos</div>
+                <div class="value">{brl(data["expenses_effective"])}</div>
+                <div class="muted">Casa mais Pessoal mais A pagar</div>
+              </div>
+              <div class="box">
+                <div class="label">Sobra do mês</div>
+                <div class="value">{brl(data["sobra"])}</div>
+                <div class="muted">Renda menos Gastos efetivos</div>
+              </div>
+              <div class="box">
+                <div class="label">Atalho</div>
+                <div class="value">{month_ref}</div>
+                <div class="muted">Mês de referência</div>
+              </div>
+            </div>
+
+            <p class="muted" style="margin-top:10px;">
+              Nota: A receber não entra na sobra, porque ainda não caiu no seu saldo. A pagar entra, porque é custo que você tem que cobrir.
+            </p>
+          </div>
+
+          <div class="card">
+            <h3>Minha parte da casa por categoria</h3>
+            <table>
+              <thead><tr><th>Categoria</th><th class="right">Valor</th></tr></thead>
+              <tbody>{rows_from(data["cats_house"])}</tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h3>Meu pessoal por categoria</h3>
+            <table>
+              <thead><tr><th>Categoria</th><th class="right">Valor</th></tr></thead>
+              <tbody>{rows_from(data["cats_personal"])}</tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h3>A receber do outro por categoria</h3>
+            <table>
+              <thead><tr><th>Categoria</th><th class="right">Valor</th></tr></thead>
+              <tbody>{rows_from(data["cats_recv"])}</tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h3>A pagar para o outro por categoria</h3>
+            <table>
+              <thead><tr><th>Categoria</th><th class="right">Valor</th></tr></thead>
+              <tbody>{rows_from(data["cats_pay"])}</tbody>
             </table>
           </div>
 
