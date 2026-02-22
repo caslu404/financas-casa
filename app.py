@@ -3,6 +3,7 @@ import io
 import sqlite3
 import datetime as dt
 import uuid
+import hashlib
 import pandas as pd
 
 app = Flask(__name__)
@@ -44,13 +45,18 @@ BASE_CSS = """
   .btnPrimary:hover { opacity: .92; }
   .btnDanger { background: #b00020; color: #fff; border-color: #b00020; }
   .btnDanger:hover { opacity: .92; }
+  .btnGhost { background: #fff; color: #111; border-color: #ddd; }
   .card { background: #fff; border: 1px solid #eee; border-radius: 16px; padding: 18px; margin-top: 14px; box-shadow: 0 8px 24px rgba(0,0,0,.05); }
   h1, h2, h3 { margin: 0 0 10px; }
   p { margin: 0 0 10px; color: #444; }
   label { font-weight: 700; display: block; margin-top: 10px; margin-bottom: 6px; }
-  input[type="text"], input[type="number"], input[type="file"], select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 12px; background: #fff; }
+  input[type="text"], input[type="number"], input[type="file"], select, textarea {
+    width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 12px; background: #fff;
+  }
+  textarea { min-height: 90px; resize: vertical; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .grid4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; }
   .errorBox { border: 1px solid #f3b6b6; background: #fff3f3; padding: 12px; border-radius: 12px; }
   .okBox { border: 1px solid #bfe6c8; background: #f3fff6; padding: 12px; border-radius: 12px; }
   table { width: 100%; border-collapse: collapse; margin-top: 10px; }
@@ -63,7 +69,8 @@ BASE_CSS = """
   .kpi .label { font-size: 12px; color: #666; margin-bottom: 6px; }
   .kpi .value { font-size: 20px; font-weight: 800; }
   .right { text-align: right; }
-  @media (max-width: 900px) { .grid3 { grid-template-columns: 1fr; } .kpi { grid-template-columns: 1fr; } .grid2 { grid-template-columns: 1fr; } }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  @media (max-width: 900px) { .grid4 { grid-template-columns: 1fr; } .grid3 { grid-template-columns: 1fr; } .kpi { grid-template-columns: 1fr; } .grid2 { grid-template-columns: 1fr; } }
 </style>
 """
 
@@ -91,10 +98,17 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def _col_exists(conn, table: str, col: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    return col in cols
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
 
+    # Imports
     cur.execute("""
     CREATE TABLE IF NOT EXISTS imports (
       batch_id TEXT PRIMARY KEY,
@@ -107,6 +121,13 @@ def init_db():
     )
     """)
 
+    # Add migrations to imports
+    if not _col_exists(conn, "imports", "file_hash"):
+        cur.execute("ALTER TABLE imports ADD COLUMN file_hash TEXT")
+    if not _col_exists(conn, "imports", "source"):
+        cur.execute("ALTER TABLE imports ADD COLUMN source TEXT")  # 'excel' ou 'manual'
+
+    # Transactions
     cur.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +147,7 @@ def init_db():
     )
     """)
 
+    # Incomes
     cur.execute("""
     CREATE TABLE IF NOT EXISTS incomes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +156,20 @@ def init_db():
       salario_1 REAL NOT NULL DEFAULT 0,
       salario_2 REAL NOT NULL DEFAULT 0,
       extras REAL NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(month_ref, profile)
+    )
+    """)
+
+    # Investments (tracking do quanto foi guardado/investido no mês)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS investments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      month_ref TEXT NOT NULL,
+      profile TEXT NOT NULL,
+      amount REAL NOT NULL DEFAULT 0,
+      note TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(month_ref, profile)
@@ -152,10 +188,13 @@ def topbar_html(profile: str):
         <div class="nav">
           <a class="btn" href="{url_for('dashboard')}">Painel</a>
           <a class="btn" href="{url_for('upload')}">Upload</a>
+          <a class="btn" href="{url_for('manual_add')}">Adicionar</a>
+          <a class="btn" href="{url_for('entries')}">Lançamentos</a>
           <a class="btn" href="{url_for('imports_list')}">Importações</a>
           <a class="btn" href="{url_for('casa')}">Casa</a>
           <a class="btn" href="{url_for('individual')}">Individual</a>
           <a class="btn" href="{url_for('renda')}">Renda</a>
+          <a class="btn" href="{url_for('investimentos')}">Investimentos</a>
           <a class="btn" href="{url_for('home')}">Trocar perfil</a>
         </div>
         """
@@ -173,8 +212,56 @@ def topbar_html(profile: str):
     </div>
     """
 
-def read_excel_from_upload(file_storage) -> pd.DataFrame:
-    raw = file_storage.read()
+def signed_value(tipo: str, valor: float) -> float:
+    # Saida soma, Entrada subtrai
+    if tipo == "Entrada":
+        return -abs(valor)
+    return abs(valor)
+
+def share_for(profile: str, rateio: str) -> float:
+    if rateio == "50_50":
+        return 0.5
+    if rateio == "60_40":
+        return LUCAS_SHARE if profile == "Lucas" else RAFA_SHARE
+    return 0.0
+
+def year_month_select_html(selected_year: str, selected_month: str):
+    year_options = "".join([
+        f"<option value='{y}' {'selected' if str(y)==str(selected_year) else ''}>{y}</option>"
+        for y in range(2024, 2031)
+    ])
+    month_options = "".join([
+        f"<option value='{m:02d}' {'selected' if f'{m:02d}'==str(selected_month) else ''}>{m:02d}</option>"
+        for m in range(1, 13)
+    ])
+    return year_options, month_options
+
+def month_selector_block(selected_year: str, selected_month: str, action_url: str):
+    year_options, month_options = year_month_select_html(selected_year, selected_month)
+    month_ref = month_ref_from(selected_year, selected_month)
+    return f"""
+      <form method="get" action="{action_url}">
+        <div class="grid2">
+          <div>
+            <label>Ano</label>
+            <select name="Ano">{year_options}</select>
+          </div>
+          <div>
+            <label>Mês</label>
+            <select name="Mes">{month_options}</select>
+          </div>
+        </div>
+        <p class="muted" style="margin-top:10px;">Mês de referência: <b>{month_ref}</b></p>
+        <div class="row" style="justify-content:flex-start; margin-top:10px;">
+          <button class="btn btnPrimary" type="submit">Atualizar</button>
+        </div>
+      </form>
+    """
+
+def compute_file_hash(raw_bytes: bytes) -> str:
+    return hashlib.sha256(raw_bytes).hexdigest()
+
+def read_excel_from_bytes(raw: bytes) -> pd.DataFrame:
     buf = io.BytesIO(raw)
     df = pd.read_excel(buf, engine="openpyxl")
 
@@ -183,7 +270,6 @@ def read_excel_from_upload(file_storage) -> pd.DataFrame:
         raise ValueError("Colunas faltando: " + ", ".join(missing))
 
     df = df.copy()
-
     for col in ["Estabelecimento", "Categoria", "Tipo", "Dono", "Rateio", "Observacao", "Parcela"]:
         df[col] = df[col].apply(_normalize_str)
 
@@ -215,6 +301,7 @@ def validate_transactions(df: pd.DataFrame):
         if rateio not in ALLOWED_RATEIO:
             errors.append(f"Linha {line_number}: Rateio inválido, use 60_40, 50_50, 100_meu ou 100_outro")
 
+        # Regras Dono x Rateio
         if rateio in {"60_40", "50_50"} and dono != "Casa":
             errors.append(f"Linha {line_number}: Rateio {rateio} exige Dono Casa")
 
@@ -237,42 +324,64 @@ def validate_transactions(df: pd.DataFrame):
 
     return errors, normalized_rows
 
-def create_preview_batch(month_ref: str, uploaded_by: str, filename: str, rows: list[dict]) -> str:
+def _insert_import(conn, batch_id, month_ref, uploaded_by, filename, row_count, status, created_at, file_hash, source):
+    cur = conn.cursor()
+    cur.execute("""
+      INSERT INTO imports (batch_id, month_ref, uploaded_by, filename, row_count, status, created_at, file_hash, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (batch_id, month_ref, uploaded_by, filename, row_count, status, created_at, file_hash, source))
+
+def _insert_transaction(conn, batch_id, month_ref, uploaded_by, r, created_at):
+    cur = conn.cursor()
+    cur.execute("""
+      INSERT INTO transactions
+      (batch_id, month_ref, uploaded_by, dt_text, estabelecimento, categoria, valor, tipo, dono, rateio, observacao, parcela, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        batch_id,
+        month_ref,
+        uploaded_by,
+        r.get("Data", ""),
+        r.get("Estabelecimento", ""),
+        r.get("Categoria", ""),
+        float(r.get("Valor") or 0),
+        r.get("Tipo", ""),
+        r.get("Dono", ""),
+        r.get("Rateio", ""),
+        r.get("Observacao", ""),
+        r.get("Parcela", ""),
+        created_at
+    ))
+
+def create_preview_batch(month_ref: str, uploaded_by: str, filename: str, rows: list[dict], file_hash: str) -> str:
     batch_id = uuid.uuid4().hex
     now = dt.datetime.utcnow().isoformat(timespec="seconds")
 
     conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-      INSERT INTO imports (batch_id, month_ref, uploaded_by, filename, row_count, status, created_at)
-      VALUES (?, ?, ?, ?, ?, 'preview', ?)
-    """, (batch_id, month_ref, uploaded_by, filename, len(rows), now))
+    _insert_import(conn, batch_id, month_ref, uploaded_by, filename, len(rows), "preview", now, file_hash, "excel")
 
     for r in rows:
-        cur.execute("""
-          INSERT INTO transactions
-          (batch_id, month_ref, uploaded_by, dt_text, estabelecimento, categoria, valor, tipo, dono, rateio, observacao, parcela, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            batch_id,
-            month_ref,
-            uploaded_by,
-            r.get("Data", ""),
-            r.get("Estabelecimento", ""),
-            r.get("Categoria", ""),
-            float(r.get("Valor") or 0),
-            r.get("Tipo", ""),
-            r.get("Dono", ""),
-            r.get("Rateio", ""),
-            r.get("Observacao", ""),
-            r.get("Parcela", ""),
-            now
-        ))
+        _insert_transaction(conn, batch_id, month_ref, uploaded_by, r, now)
 
     conn.commit()
     conn.close()
     return batch_id
+
+def is_duplicate_import(month_ref: str, uploaded_by: str, file_hash: str) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT 1
+      FROM imports
+      WHERE month_ref = ?
+        AND uploaded_by = ?
+        AND file_hash = ?
+        AND status = 'imported'
+      LIMIT 1
+    """, (month_ref, uploaded_by, file_hash))
+    hit = cur.fetchone() is not None
+    conn.close()
+    return hit
 
 def finalize_import(batch_id: str, profile: str) -> tuple[bool, str]:
     conn = get_db()
@@ -317,18 +426,6 @@ def delete_batch(batch_id: str, profile: str) -> tuple[bool, str]:
     conn.close()
     return True, "Importação excluída"
 
-def signed_value(tipo: str, valor: float) -> float:
-    if tipo == "Entrada":
-        return -abs(valor)
-    return abs(valor)
-
-def share_for(profile: str, rateio: str) -> float:
-    if rateio == "50_50":
-        return 0.5
-    if rateio == "60_40":
-        return LUCAS_SHARE if profile == "Lucas" else RAFA_SHARE
-    return 0.0
-
 def fetch_imported_transactions(month_ref: str):
     conn = get_db()
     cur = conn.cursor()
@@ -344,9 +441,25 @@ def fetch_imported_transactions(month_ref: str):
     conn.close()
     return rows
 
+def fetch_house_transactions(month_ref: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT t.*
+      FROM transactions t
+      JOIN imports i ON i.batch_id = t.batch_id
+      WHERE t.month_ref = ?
+        AND i.status = 'imported'
+        AND t.dono = 'Casa'
+        AND t.rateio IN ('60_40','50_50')
+      ORDER BY t.id ASC
+    """, (month_ref,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
 def compute_casa(month_ref: str):
-    rows_all = fetch_imported_transactions(month_ref)
-    rows = [r for r in rows_all if r["dono"] == "Casa" and r["rateio"] in ("60_40", "50_50")]
+    rows = fetch_house_transactions(month_ref)
 
     total_casa = 0.0
     paid_lucas = 0.0
@@ -427,9 +540,7 @@ def upsert_income(month_ref: str, profile: str, salario_1: float, salario_2: flo
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("""
-      SELECT id FROM incomes WHERE month_ref = ? AND profile = ?
-    """, (month_ref, profile))
+    cur.execute("SELECT id FROM incomes WHERE month_ref = ? AND profile = ?", (month_ref, profile))
     exists = cur.fetchone() is not None
 
     if exists:
@@ -443,6 +554,43 @@ def upsert_income(month_ref: str, profile: str, salario_1: float, salario_2: flo
           INSERT INTO incomes (month_ref, profile, salario_1, salario_2, extras, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (month_ref, profile, salario_1, salario_2, extras, now, now))
+
+    conn.commit()
+    conn.close()
+
+def get_investment(month_ref: str, profile: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT amount, note
+      FROM investments
+      WHERE month_ref = ? AND profile = ?
+    """, (month_ref, profile))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"amount": 0.0, "note": ""}
+    return {"amount": float(row["amount"] or 0), "note": row["note"] or ""}
+
+def upsert_investment(month_ref: str, profile: str, amount: float, note: str):
+    now = dt.datetime.utcnow().isoformat(timespec="seconds")
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM investments WHERE month_ref = ? AND profile = ?", (month_ref, profile))
+    exists = cur.fetchone() is not None
+
+    if exists:
+        cur.execute("""
+          UPDATE investments
+          SET amount = ?, note = ?, updated_at = ?
+          WHERE month_ref = ? AND profile = ?
+        """, (amount, note, now, month_ref, profile))
+    else:
+        cur.execute("""
+          INSERT INTO investments (month_ref, profile, amount, note, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        """, (month_ref, profile, amount, note, now, now))
 
     conn.commit()
     conn.close()
@@ -466,6 +614,7 @@ def compute_individual(month_ref: str, profile: str):
         val = signed_value(r["tipo"], r["valor"])
         cat = r["categoria"] or "Sem categoria"
 
+        # Minha parte da Casa (sempre pelo rateio, independente de quem pagou)
         if r["dono"] == "Casa" and r["rateio"] in ("60_40", "50_50"):
             sh = share_for(profile, r["rateio"])
             part = val * sh
@@ -473,25 +622,31 @@ def compute_individual(month_ref: str, profile: str):
             house_by_cat[cat] = house_by_cat.get(cat, 0.0) + part
             continue
 
+        # Meu pessoal (eu subi e é meu)
         if r["rateio"] == "100_meu" and r["uploaded_by"] == profile and r["dono"] == profile:
             my_personal_total += val
             my_personal_by_cat[cat] = my_personal_by_cat.get(cat, 0.0) + val
             continue
 
+        # Eu paguei algo que é 100% do outro (a receber)
         if r["rateio"] == "100_outro" and r["uploaded_by"] == profile and r["dono"] != "Casa" and r["dono"] != profile:
             receivable_total += val
             receivable_by_cat[cat] = receivable_by_cat.get(cat, 0.0) + val
             continue
 
+        # O outro pagou algo que é 100% meu (eu devo pagar)
         if r["rateio"] == "100_outro" and r["uploaded_by"] != profile and r["dono"] == profile:
             payable_total += val
             payable_by_cat[cat] = payable_by_cat.get(cat, 0.0) + val
             continue
 
     income = get_income(month_ref, profile)
+    inv = get_investment(month_ref, profile)
+    invested = float(inv["amount"] or 0)
 
     expenses_effective = house_total + my_personal_total + payable_total
     sobra = income["total"] - expenses_effective
+    sobra_pos_invest = sobra - invested
 
     cats_house = sorted(house_by_cat.items(), key=lambda x: x[1], reverse=True)
     cats_personal = sorted(my_personal_by_cat.items(), key=lambda x: x[1], reverse=True)
@@ -500,50 +655,130 @@ def compute_individual(month_ref: str, profile: str):
 
     return {
         "income": income,
+        "invested": invested,
         "house_total": house_total,
         "my_personal_total": my_personal_total,
         "receivable_total": receivable_total,
         "payable_total": payable_total,
         "expenses_effective": expenses_effective,
         "sobra": sobra,
+        "sobra_pos_invest": sobra_pos_invest,
         "cats_house": cats_house,
         "cats_personal": cats_personal,
         "cats_recv": cats_recv,
         "cats_pay": cats_pay,
     }
 
-def year_month_select_html(selected_year: str, selected_month: str):
-    year_options = "".join([
-        f"<option value='{y}' {'selected' if str(y)==str(selected_year) else ''}>{y}</option>"
-        for y in range(2024, 2031)
-    ])
-    month_options = "".join([
-        f"<option value='{m:02d}' {'selected' if f'{m:02d}'==str(selected_month) else ''}>{m:02d}</option>"
-        for m in range(1, 13)
-    ])
-    return year_options, month_options
+def create_manual_batch(month_ref: str, uploaded_by: str, row: dict) -> str:
+    batch_id = uuid.uuid4().hex
+    now = dt.datetime.utcnow().isoformat(timespec="seconds")
 
-def month_selector_block(selected_year: str, selected_month: str, action_url: str):
-    year_options, month_options = year_month_select_html(selected_year, selected_month)
-    month_ref = month_ref_from(selected_year, selected_month)
-    return f"""
-      <form method="get" action="{action_url}">
-        <div class="grid2">
-          <div>
-            <label>Ano</label>
-            <select name="Ano">{year_options}</select>
-          </div>
-          <div>
-            <label>Mês</label>
-            <select name="Mes">{month_options}</select>
-          </div>
-        </div>
-        <p class="muted" style="margin-top:10px;">Mês de referência: <b>{month_ref}</b></p>
-        <div class="row" style="justify-content:flex-start; margin-top:10px;">
-          <button class="btn btnPrimary" type="submit">Atualizar</button>
-        </div>
-      </form>
-    """
+    conn = get_db()
+    _insert_import(conn, batch_id, month_ref, uploaded_by, "manual_entry", 1, "imported", now, None, "manual")
+    _insert_transaction(conn, batch_id, month_ref, uploaded_by, row, now)
+
+    conn.commit()
+    conn.close()
+    return batch_id
+
+def is_manual_transaction(tx_id: int) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT i.source
+      FROM transactions t
+      JOIN imports i ON i.batch_id = t.batch_id
+      WHERE t.id = ?
+      LIMIT 1
+    """, (tx_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and (row["source"] == "manual"))
+
+def get_transaction(tx_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT t.*, i.source
+      FROM transactions t
+      JOIN imports i ON i.batch_id = t.batch_id
+      WHERE t.id = ?
+      LIMIT 1
+    """, (tx_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def update_transaction(tx_id: int, profile: str, new_row: dict) -> tuple[bool, str]:
+    tx = get_transaction(tx_id)
+    if not tx:
+        return False, "Lançamento não encontrado"
+    if tx["uploaded_by"] != profile:
+        return False, "Você só pode editar lançamentos do seu perfil"
+    if tx["source"] != "manual":
+        return False, "Somente lançamentos manuais podem ser editados aqui"
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+      UPDATE transactions
+      SET dt_text = ?, estabelecimento = ?, categoria = ?, valor = ?, tipo = ?, dono = ?, rateio = ?, observacao = ?, parcela = ?
+      WHERE id = ?
+    """, (
+        new_row.get("Data", ""),
+        new_row.get("Estabelecimento", ""),
+        new_row.get("Categoria", ""),
+        float(new_row.get("Valor") or 0),
+        new_row.get("Tipo", ""),
+        new_row.get("Dono", ""),
+        new_row.get("Rateio", ""),
+        new_row.get("Observacao", ""),
+        new_row.get("Parcela", ""),
+        tx_id
+    ))
+    conn.commit()
+    conn.close()
+    return True, "Lançamento atualizado"
+
+def delete_transaction(tx_id: int, profile: str) -> tuple[bool, str]:
+    tx = get_transaction(tx_id)
+    if not tx:
+        return False, "Lançamento não encontrado"
+    if tx["uploaded_by"] != profile:
+        return False, "Você só pode excluir lançamentos do seu perfil"
+    if tx["source"] != "manual":
+        return False, "Somente lançamentos manuais podem ser excluídos aqui"
+
+    batch_id = tx["batch_id"]
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
+
+    # Se o batch ficou vazio, remove o import também
+    cur.execute("SELECT COUNT(*) as c FROM transactions WHERE batch_id = ?", (batch_id,))
+    c = int(cur.fetchone()["c"])
+    if c == 0:
+        cur.execute("DELETE FROM imports WHERE batch_id = ?", (batch_id,))
+
+    conn.commit()
+    conn.close()
+    return True, "Lançamento excluído"
+
+def list_entries(month_ref: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT t.*, i.source, i.status
+      FROM transactions t
+      JOIN imports i ON i.batch_id = t.batch_id
+      WHERE t.month_ref = ? AND i.status = 'imported'
+      ORDER BY t.id DESC
+      LIMIT 400
+    """, (month_ref,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 @app.route("/")
 def home():
@@ -590,9 +825,9 @@ def dashboard():
         return redirect(url_for("home"))
 
     now_y, now_m = current_year_month()
-    default_year = request.args.get("Ano") or "2026"
-    default_month = request.args.get("Mes") or f"{now_m:02d}"
-    month_ref = month_ref_from(default_year, default_month)
+    selected_year = request.args.get("Ano") or "2026"
+    selected_month = request.args.get("Mes") or f"{now_m:02d}"
+    month_ref = month_ref_from(selected_year, selected_month)
 
     html = f"""
     <!doctype html>
@@ -608,12 +843,14 @@ def dashboard():
         <div class="wrap">
           <div class="card">
             <h2>Painel do {profile}</h2>
-            <p class="muted">Sugestão: preencha Renda e depois abra Individual.</p>
-            {month_selector_block(default_year, default_month, url_for('dashboard'))}
+            <p class="muted">Fluxo sugerido: Renda e Investimentos e depois Individual.</p>
+            {month_selector_block(selected_year, selected_month, url_for('dashboard'))}
             <div class="row" style="justify-content:flex-start; margin-top:12px;">
-              <a class="btn btnPrimary" href="{url_for('renda')}?Ano={default_year}&Mes={default_month}">Abrir Renda</a>
-              <a class="btn btnPrimary" href="{url_for('individual')}?Ano={default_year}&Mes={default_month}">Abrir Individual</a>
-              <a class="btn" href="{url_for('casa')}?month_ref={month_ref}">Abrir Casa</a>
+              <a class="btn btnPrimary" href="{url_for('renda')}?Ano={selected_year}&Mes={selected_month}">Renda</a>
+              <a class="btn btnPrimary" href="{url_for('investimentos')}?Ano={selected_year}&Mes={selected_month}">Investimentos</a>
+              <a class="btn btnPrimary" href="{url_for('individual')}?Ano={selected_year}&Mes={selected_month}">Individual</a>
+              <a class="btn" href="{url_for('casa')}?month_ref={month_ref}">Casa</a>
+              <a class="btn" href="{url_for('manual_add')}?Ano={selected_year}&Mes={selected_month}">Adicionar lançamento</a>
             </div>
           </div>
         </div>
@@ -632,8 +869,8 @@ def upload():
     default_year = "2026"
     default_month = f"{now_m:02d}"
 
-    selected_year = request.form.get("Ano") or default_year
-    selected_month = request.form.get("Mes") or default_month
+    selected_year = request.form.get("Ano") or request.args.get("Ano") or default_year
+    selected_month = request.form.get("Mes") or request.args.get("Mes") or default_month
     month_ref = month_ref_from(selected_year, selected_month)
 
     errors = []
@@ -662,10 +899,17 @@ def upload():
 
         if not errors:
             try:
-                df = read_excel_from_upload(file)
-                errors, preview_rows = validate_transactions(df)
-                if not errors:
-                    batch_id = create_preview_batch(month_ref, profile, file.filename, preview_rows)
+                raw = file.read()
+                file_hash = compute_file_hash(raw)
+
+                if is_duplicate_import(month_ref, profile, file_hash):
+                    errors.append("Esse mesmo arquivo já foi importado neste mês para este perfil. Vá em Importações para ver e, se precisar, excluir.")
+                else:
+                    df = read_excel_from_bytes(raw)
+                    errors, preview_rows = validate_transactions(df)
+                    if not errors:
+                        batch_id = create_preview_batch(month_ref, profile, file.filename, preview_rows, file_hash)
+
             except Exception as e:
                 errors.append(str(e))
 
@@ -769,6 +1013,11 @@ def upload():
               <p class="muted" style="margin-top:12px;">Ao escolher o arquivo, o preview abre automaticamente.</p>
               <p class="muted">Colunas obrigatórias: {", ".join(REQUIRED_COLUMNS)}</p>
             </form>
+
+            <div class="row" style="justify-content:flex-start; margin-top:12px;">
+              <a class="btn" href="{url_for('manual_add')}?Ano={selected_year}&Mes={selected_month}">Adicionar lançamento manual</a>
+              <a class="btn" href="{url_for('entries')}?month_ref={month_ref}">Ver lançamentos do mês</a>
+            </div>
           </div>
 
           {error_block}
@@ -816,6 +1065,7 @@ def imports_list():
 
     conn = get_db()
     cur = conn.cursor()
+
     cur.execute("""
       SELECT * FROM imports
       WHERE month_ref = ?
@@ -842,15 +1092,17 @@ def imports_list():
             <td>{imp['created_at']}</td>
             <td>{imp['uploaded_by']}</td>
             <td>{imp['status']}</td>
+            <td>{imp['source'] or ''}</td>
             <td>{imp['filename'] or ''}</td>
             <td class="right">{imp['row_count']}</td>
-            <td>{imp['batch_id'][:10]}...</td>
+            <td class="mono">{(imp['batch_id'][:10] + '...')}</td>
+            <td class="mono">{(imp['file_hash'][:10] + '...') if imp['file_hash'] else ''}</td>
             <td>{del_btn}</td>
           </tr>
         """
 
     if not rows_html:
-        rows_html = "<tr><td colspan='7' class='muted'>Sem importações para esse mês</td></tr>"
+        rows_html = "<tr><td colspan='9' class='muted'>Sem importações para esse mês</td></tr>"
 
     msg_block = ""
     if msg:
@@ -884,7 +1136,7 @@ def imports_list():
               <input type="text" name="month_ref" value="{month_ref}" placeholder="202602" />
               <div class="row" style="justify-content:flex-start; margin-top:12px;">
                 <button class="btn btnPrimary" type="submit">Atualizar</button>
-                <a class="btn" href="{url_for('upload')}">Novo Upload</a>
+                <a class="btn" href="{url_for('upload')}?Ano={month_ref[:4]}&Mes={month_ref[4:]}">Novo Upload</a>
               </div>
             </form>
 
@@ -894,9 +1146,11 @@ def imports_list():
                   <th>Data</th>
                   <th>Perfil</th>
                   <th>Status</th>
+                  <th>Fonte</th>
                   <th>Arquivo</th>
                   <th class="right">Linhas</th>
                   <th>Batch</th>
+                  <th>Hash</th>
                   <th>Ações</th>
                 </tr>
               </thead>
@@ -955,13 +1209,14 @@ def casa():
 
           <div class="card">
             <h2>Casa</h2>
-            <p>Mostrando somente Dono Casa com rateio 60_40 e 50_50, somente batches importados.</p>
+            <p>Somente Dono Casa com rateio 60_40 e 50_50, somente batches importados.</p>
             <form method="get">
               <label>Mês de referência</label>
               <input type="text" name="month_ref" value="{month_ref}" placeholder="202602" />
               <div class="row" style="justify-content:flex-start; margin-top:12px;">
                 <button class="btn btnPrimary" type="submit">Atualizar</button>
                 <a class="btn" href="{url_for('imports_list')}?month_ref={month_ref}">Ver Importações do mês</a>
+                <a class="btn" href="{url_for('entries')}?month_ref={month_ref}">Ver lançamentos</a>
               </div>
               <p class="muted" style="margin-top:10px;">Formato: YYYYMM</p>
             </form>
@@ -1117,6 +1372,96 @@ def renda():
     """
     return html
 
+@app.route("/investimentos", methods=["GET", "POST"])
+def investimentos():
+    profile = session.get("profile", "")
+    if not profile:
+        return redirect(url_for("home"))
+
+    now_y, now_m = current_year_month()
+    selected_year = request.values.get("Ano") or "2026"
+    selected_month = request.values.get("Mes") or f"{now_m:02d}"
+    month_ref = month_ref_from(selected_year, selected_month)
+
+    msg = ""
+    msg_ok = True
+
+    if request.method == "POST":
+        def num(v):
+            try:
+                v = str(v).replace(".", "").replace(",", ".")
+                return float(v) if v else 0.0
+            except:
+                return 0.0
+
+        amount = num(request.form.get("amount"))
+        note = _normalize_str(request.form.get("note"))
+        upsert_investment(month_ref, profile, amount, note)
+        msg = "Investimento salvo"
+        msg_ok = True
+
+    inv = get_investment(month_ref, profile)
+
+    msg_block = ""
+    if msg:
+        klass = "okBox" if msg_ok else "errorBox"
+        msg_block = f"""
+          <div class="card">
+            <div class="{klass}">
+              <b>{msg}</b>
+            </div>
+          </div>
+        """
+
+    html = f"""
+    <!doctype html>
+    <html lang="pt-br">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Investimentos</title>
+        {BASE_CSS}
+      </head>
+      <body>
+        {topbar_html(profile)}
+        <div class="wrap">
+          <div class="card">
+            <h2>Investimentos do {profile}</h2>
+            <p class="muted">Tracking simples: quanto você guardou/investiu no mês, depois do fechamento.</p>
+            {month_selector_block(selected_year, selected_month, url_for('investimentos'))}
+          </div>
+
+          <div class="card">
+            <h3>Valor do mês</h3>
+            <form method="post">
+              <input type="hidden" name="Ano" value="{selected_year}">
+              <input type="hidden" name="Mes" value="{selected_month}">
+
+              <div class="grid2">
+                <div>
+                  <label>Quanto você guardou/investiu</label>
+                  <input type="text" name="amount" value="{inv['amount']:.2f}" />
+                </div>
+                <div>
+                  <label>Observação (opcional)</label>
+                  <input type="text" name="note" value="{inv['note']}" />
+                </div>
+              </div>
+
+              <div class="row" style="justify-content:flex-start; margin-top:12px;">
+                <button class="btn btnPrimary" type="submit">Salvar</button>
+                <a class="btn" href="{url_for('individual')}?Ano={selected_year}&Mes={selected_month}">Ver Individual</a>
+              </div>
+            </form>
+          </div>
+
+          {msg_block}
+        </div>
+      </body>
+    </html>
+    """
+    return html
+
 @app.route("/individual", methods=["GET"])
 def individual():
     profile = session.get("profile", "")
@@ -1155,7 +1500,9 @@ def individual():
             {month_selector_block(selected_year, selected_month, url_for('individual'))}
             <div class="row" style="justify-content:flex-start; margin-top:12px;">
               <a class="btn btnPrimary" href="{url_for('renda')}?Ano={selected_year}&Mes={selected_month}">Editar Renda</a>
+              <a class="btn btnPrimary" href="{url_for('investimentos')}?Ano={selected_year}&Mes={selected_month}">Editar Investimentos</a>
               <a class="btn" href="{url_for('casa')}?month_ref={month_ref}">Ver Casa</a>
+              <a class="btn" href="{url_for('entries')}?month_ref={month_ref}">Ver lançamentos</a>
             </div>
           </div>
 
@@ -1188,23 +1535,42 @@ def individual():
               <div class="box">
                 <div class="label">Gastos efetivos</div>
                 <div class="value">{brl(data["expenses_effective"])}</div>
-                <div class="muted">Casa mais Pessoal mais A pagar</div>
+                <div class="muted">Casa + Pessoal + A pagar</div>
               </div>
               <div class="box">
                 <div class="label">Sobra do mês</div>
                 <div class="value">{brl(data["sobra"])}</div>
-                <div class="muted">Renda menos Gastos efetivos</div>
+                <div class="muted">Renda - Gastos efetivos</div>
+              </div>
+              <div class="box">
+                <div class="label">Investido no mês</div>
+                <div class="value">{brl(data["invested"])}</div>
+                <div class="muted">Tracking manual</div>
+              </div>
+            </div>
+
+            <div class="kpi" style="margin-top:12px;">
+              <div class="box">
+                <div class="label">Sobra após investir</div>
+                <div class="value">{brl(data["sobra_pos_invest"])}</div>
+                <div class="muted">Sobra - Investido</div>
               </div>
               <div class="box">
                 <div class="label">Atalho</div>
                 <div class="value">{month_ref}</div>
                 <div class="muted">Mês de referência</div>
               </div>
+              <div class="box">
+                <div class="label">Ação rápida</div>
+                <div class="value">+</div>
+                <div class="muted"><a class="btn btnPrimary" href="{url_for('manual_add')}?Ano={selected_year}&Mes={selected_month}">Adicionar lançamento</a></div>
+              </div>
+              <div class="box">
+                <div class="label">Nota</div>
+                <div class="value">•</div>
+                <div class="muted">A receber não entra na sobra até cair no saldo</div>
+              </div>
             </div>
-
-            <p class="muted" style="margin-top:10px;">
-              Nota: A receber não entra na sobra, porque ainda não caiu no seu saldo. A pagar entra, porque é custo que você tem que cobrir.
-            </p>
           </div>
 
           <div class="card">
@@ -1244,6 +1610,481 @@ def individual():
     </html>
     """
     return html
+
+@app.route("/entries", methods=["GET"])
+def entries():
+    profile = session.get("profile", "")
+    if not profile:
+        return redirect(url_for("home"))
+
+    now_y, now_m = current_year_month()
+    default_year = "2026"
+    default_month = f"{now_m:02d}"
+    month_ref = request.args.get("month_ref") or f"{default_year}{default_month}"
+
+    rows = list_entries(month_ref)
+
+    body = ""
+    for r in rows:
+        val = signed_value(r["tipo"], r["valor"])
+        src = r["source"] or ""
+        can_edit = (src == "manual" and r["uploaded_by"] == profile)
+        actions = ""
+        if can_edit:
+            actions = f"""
+              <a class="btn" href="{url_for('manual_edit', tx_id=r['id'])}">Editar</a>
+              <a class="btn btnDanger" href="{url_for('manual_delete', tx_id=r['id'])}">Excluir</a>
+            """
+        body += f"""
+          <tr>
+            <td class="mono">{r['id']}</td>
+            <td>{r['uploaded_by']}</td>
+            <td>{src}</td>
+            <td>{r['dt_text'] or ''}</td>
+            <td>{r['estabelecimento'] or ''}</td>
+            <td>{r['categoria'] or ''}</td>
+            <td class="right">{brl(val)}</td>
+            <td>{r['tipo']}</td>
+            <td>{r['dono']}</td>
+            <td>{r['rateio']}</td>
+            <td>{actions}</td>
+          </tr>
+        """
+
+    if not body:
+        body = "<tr><td colspan='11' class='muted'>Sem lançamentos importados para esse mês</td></tr>"
+
+    html = f"""
+    <!doctype html>
+    <html lang="pt-br">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Lançamentos</title>
+        {BASE_CSS}
+      </head>
+      <body>
+        {topbar_html(profile)}
+        <div class="wrap">
+          <div class="card">
+            <h2>Lançamentos</h2>
+            <form method="get">
+              <label>Mês de referência</label>
+              <input type="text" name="month_ref" value="{month_ref}" placeholder="202602" />
+              <div class="row" style="justify-content:flex-start; margin-top:12px;">
+                <button class="btn btnPrimary" type="submit">Atualizar</button>
+                <a class="btn" href="{url_for('manual_add')}?Ano={month_ref[:4]}&Mes={month_ref[4:]}">Adicionar manual</a>
+              </div>
+              <p class="muted" style="margin-top:10px;">Você só consegue editar/excluir lançamentos manuais feitos no seu perfil.</p>
+            </form>
+
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Pagador</th>
+                  <th>Fonte</th>
+                  <th>Data</th>
+                  <th>Estabelecimento</th>
+                  <th>Categoria</th>
+                  <th class="right">Valor</th>
+                  <th>Tipo</th>
+                  <th>Dono</th>
+                  <th>Rateio</th>
+                  <th>Ações</th>
+                </tr>
+              </thead>
+              <tbody>
+                {body}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    return html
+
+@app.route("/manual/add", methods=["GET", "POST"])
+def manual_add():
+    profile = session.get("profile", "")
+    if not profile:
+        return redirect(url_for("home"))
+
+    now_y, now_m = current_year_month()
+    selected_year = request.values.get("Ano") or "2026"
+    selected_month = request.values.get("Mes") or f"{now_m:02d}"
+    month_ref = month_ref_from(selected_year, selected_month)
+
+    msg = ""
+    msg_ok = True
+    errors = []
+
+    # defaults
+    form_data = {
+        "Data": "",
+        "Estabelecimento": "",
+        "Categoria": "",
+        "Valor": "",
+        "Tipo": "Saida",
+        "Dono": "Casa",
+        "Rateio": "60_40",
+        "Observacao": "",
+        "Parcela": "",
+    }
+
+    if request.method == "POST":
+        for k in form_data.keys():
+            form_data[k] = _normalize_str(request.form.get(k))
+
+        # parse valor
+        try:
+            v = str(form_data["Valor"]).replace(".", "").replace(",", ".")
+            valor = float(v) if v else 0.0
+        except:
+            valor = 0.0
+
+        tipo = form_data["Tipo"]
+        dono = form_data["Dono"]
+        rateio = form_data["Rateio"]
+
+        if valor <= 0:
+            errors.append("Valor precisa ser maior que 0")
+        if tipo not in ALLOWED_TIPO:
+            errors.append("Tipo inválido")
+        if dono not in ALLOWED_DONO:
+            errors.append("Dono inválido")
+        if rateio not in ALLOWED_RATEIO:
+            errors.append("Rateio inválido")
+        if rateio in {"60_40", "50_50"} and dono != "Casa":
+            errors.append(f"Rateio {rateio} exige Dono Casa")
+        if rateio in {"100_meu", "100_outro"} and dono == "Casa":
+            errors.append(f"Rateio {rateio} nunca pode ter Dono Casa")
+
+        if not errors:
+            row = dict(form_data)
+            row["Valor"] = valor
+            create_manual_batch(month_ref, profile, row)
+            msg = "Lançamento manual adicionado"
+            msg_ok = True
+
+            # limpa o form
+            form_data["Data"] = ""
+            form_data["Estabelecimento"] = ""
+            form_data["Categoria"] = ""
+            form_data["Valor"] = ""
+            form_data["Observacao"] = ""
+            form_data["Parcela"] = ""
+
+    err_block = ""
+    if errors:
+        items = "".join([f"<li>{e}</li>" for e in errors[:30]])
+        err_block = f"""
+          <div class="card">
+            <h3>Erros</h3>
+            <div class="errorBox"><ul>{items}</ul></div>
+          </div>
+        """
+
+    msg_block = ""
+    if msg:
+        klass = "okBox" if msg_ok else "errorBox"
+        msg_block = f"""
+          <div class="card">
+            <div class="{klass}">
+              <b>{msg}</b>
+              <div class="row" style="justify-content:flex-start; margin-top:12px;">
+                <a class="btn btnPrimary" href="{url_for('entries')}?month_ref={month_ref}">Ver lançamentos</a>
+                <a class="btn" href="{url_for('individual')}?Ano={selected_year}&Mes={selected_month}">Ver Individual</a>
+              </div>
+            </div>
+          </div>
+        """
+
+    tipo_opts = "".join([f"<option value='{t}' {'selected' if form_data['Tipo']==t else ''}>{t}</option>" for t in sorted(ALLOWED_TIPO)])
+    dono_opts = "".join([f"<option value='{d}' {'selected' if form_data['Dono']==d else ''}>{d}</option>" for d in ["Casa","Lucas","Rafa"]])
+    rateio_opts = "".join([f"<option value='{r}' {'selected' if form_data['Rateio']==r else ''}>{r}</option>" for r in ["60_40","50_50","100_meu","100_outro"]])
+
+    html = f"""
+    <!doctype html>
+    <html lang="pt-br">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Adicionar lançamento</title>
+        {BASE_CSS}
+      </head>
+      <body>
+        {topbar_html(profile)}
+        <div class="wrap">
+          <div class="card">
+            <h2>Adicionar lançamento manual</h2>
+            <p class="muted">Pagador: <b>{profile}</b> • Isso entra automaticamente como importado (fonte manual).</p>
+            {month_selector_block(selected_year, selected_month, url_for('manual_add'))}
+          </div>
+
+          <div class="card">
+            <h3>Dados</h3>
+            <form method="post">
+              <input type="hidden" name="Ano" value="{selected_year}">
+              <input type="hidden" name="Mes" value="{selected_month}">
+
+              <div class="grid2">
+                <div>
+                  <label>Data</label>
+                  <input type="text" name="Data" value="{form_data['Data']}" placeholder="Opcional" />
+                </div>
+                <div>
+                  <label>Valor</label>
+                  <input type="text" name="Valor" value="{form_data['Valor']}" placeholder="ex: 120,50" />
+                </div>
+              </div>
+
+              <div class="grid2">
+                <div>
+                  <label>Estabelecimento</label>
+                  <input type="text" name="Estabelecimento" value="{form_data['Estabelecimento']}" />
+                </div>
+                <div>
+                  <label>Categoria</label>
+                  <input type="text" name="Categoria" value="{form_data['Categoria']}" />
+                </div>
+              </div>
+
+              <div class="grid3">
+                <div>
+                  <label>Tipo</label>
+                  <select name="Tipo">{tipo_opts}</select>
+                </div>
+                <div>
+                  <label>Dono</label>
+                  <select name="Dono">{dono_opts}</select>
+                </div>
+                <div>
+                  <label>Rateio</label>
+                  <select name="Rateio">{rateio_opts}</select>
+                </div>
+              </div>
+
+              <div class="grid2">
+                <div>
+                  <label>Parcela (opcional)</label>
+                  <input type="text" name="Parcela" value="{form_data['Parcela']}" />
+                </div>
+                <div>
+                  <label>Observação (opcional)</label>
+                  <input type="text" name="Observacao" value="{form_data['Observacao']}" />
+                </div>
+              </div>
+
+              <div class="row" style="justify-content:flex-start; margin-top:12px;">
+                <button class="btn btnPrimary" type="submit">Salvar lançamento</button>
+                <a class="btn" href="{url_for('entries')}?month_ref={month_ref}">Ver lançamentos do mês</a>
+              </div>
+            </form>
+          </div>
+
+          {err_block}
+          {msg_block}
+        </div>
+      </body>
+    </html>
+    """
+    return html
+
+@app.route("/manual/edit/<int:tx_id>", methods=["GET", "POST"])
+def manual_edit(tx_id: int):
+    profile = session.get("profile", "")
+    if not profile:
+        return redirect(url_for("home"))
+
+    tx = get_transaction(tx_id)
+    if not tx:
+        return "Lançamento não encontrado", 404
+
+    if tx["uploaded_by"] != profile:
+        return "Você só pode editar lançamentos do seu perfil", 403
+
+    if tx["source"] != "manual":
+        return "Somente lançamentos manuais podem ser editados aqui", 400
+
+    month_ref = tx["month_ref"]
+    selected_year = month_ref[:4]
+    selected_month = month_ref[4:]
+
+    msg = ""
+    msg_ok = True
+    errors = []
+
+    form_data = {
+        "Data": tx["dt_text"] or "",
+        "Estabelecimento": tx["estabelecimento"] or "",
+        "Categoria": tx["categoria"] or "",
+        "Valor": f"{float(tx['valor'] or 0):.2f}",
+        "Tipo": tx["tipo"] or "Saida",
+        "Dono": tx["dono"] or "Casa",
+        "Rateio": tx["rateio"] or "60_40",
+        "Observacao": tx["observacao"] or "",
+        "Parcela": tx["parcela"] or "",
+    }
+
+    if request.method == "POST":
+        for k in form_data.keys():
+            form_data[k] = _normalize_str(request.form.get(k))
+
+        try:
+            v = str(form_data["Valor"]).replace(".", "").replace(",", ".")
+            valor = float(v) if v else 0.0
+        except:
+            valor = 0.0
+
+        tipo = form_data["Tipo"]
+        dono = form_data["Dono"]
+        rateio = form_data["Rateio"]
+
+        if valor <= 0:
+            errors.append("Valor precisa ser maior que 0")
+        if tipo not in ALLOWED_TIPO:
+            errors.append("Tipo inválido")
+        if dono not in ALLOWED_DONO:
+            errors.append("Dono inválido")
+        if rateio not in ALLOWED_RATEIO:
+            errors.append("Rateio inválido")
+        if rateio in {"60_40", "50_50"} and dono != "Casa":
+            errors.append(f"Rateio {rateio} exige Dono Casa")
+        if rateio in {"100_meu", "100_outro"} and dono == "Casa":
+            errors.append(f"Rateio {rateio} nunca pode ter Dono Casa")
+
+        if not errors:
+            row = dict(form_data)
+            row["Valor"] = valor
+            ok, m = update_transaction(tx_id, profile, row)
+            msg = m
+            msg_ok = ok
+
+    err_block = ""
+    if errors:
+        items = "".join([f"<li>{e}</li>" for e in errors[:30]])
+        err_block = f"""
+          <div class="card">
+            <h3>Erros</h3>
+            <div class="errorBox"><ul>{items}</ul></div>
+          </div>
+        """
+
+    msg_block = ""
+    if msg:
+        klass = "okBox" if msg_ok else "errorBox"
+        msg_block = f"""
+          <div class="card">
+            <div class="{klass}">
+              <b>{msg}</b>
+            </div>
+          </div>
+        """
+
+    tipo_opts = "".join([f"<option value='{t}' {'selected' if form_data['Tipo']==t else ''}>{t}</option>" for t in sorted(ALLOWED_TIPO)])
+    dono_opts = "".join([f"<option value='{d}' {'selected' if form_data['Dono']==d else ''}>{d}</option>" for d in ["Casa","Lucas","Rafa"]])
+    rateio_opts = "".join([f"<option value='{r}' {'selected' if form_data['Rateio']==r else ''}>{r}</option>" for r in ["60_40","50_50","100_meu","100_outro"]])
+
+    html = f"""
+    <!doctype html>
+    <html lang="pt-br">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Editar lançamento</title>
+        {BASE_CSS}
+      </head>
+      <body>
+        {topbar_html(profile)}
+        <div class="wrap">
+          <div class="card">
+            <h2>Editar lançamento manual</h2>
+            <p class="muted">ID: <span class="mono">{tx_id}</span> • Mês: <b>{month_ref}</b></p>
+
+            <form method="post">
+              <div class="grid2">
+                <div>
+                  <label>Data</label>
+                  <input type="text" name="Data" value="{form_data['Data']}" />
+                </div>
+                <div>
+                  <label>Valor</label>
+                  <input type="text" name="Valor" value="{form_data['Valor']}" />
+                </div>
+              </div>
+
+              <div class="grid2">
+                <div>
+                  <label>Estabelecimento</label>
+                  <input type="text" name="Estabelecimento" value="{form_data['Estabelecimento']}" />
+                </div>
+                <div>
+                  <label>Categoria</label>
+                  <input type="text" name="Categoria" value="{form_data['Categoria']}" />
+                </div>
+              </div>
+
+              <div class="grid3">
+                <div>
+                  <label>Tipo</label>
+                  <select name="Tipo">{tipo_opts}</select>
+                </div>
+                <div>
+                  <label>Dono</label>
+                  <select name="Dono">{dono_opts}</select>
+                </div>
+                <div>
+                  <label>Rateio</label>
+                  <select name="Rateio">{rateio_opts}</select>
+                </div>
+              </div>
+
+              <div class="grid2">
+                <div>
+                  <label>Parcela (opcional)</label>
+                  <input type="text" name="Parcela" value="{form_data['Parcela']}" />
+                </div>
+                <div>
+                  <label>Observação (opcional)</label>
+                  <input type="text" name="Observacao" value="{form_data['Observacao']}" />
+                </div>
+              </div>
+
+              <div class="row" style="justify-content:flex-start; margin-top:12px;">
+                <button class="btn btnPrimary" type="submit">Salvar alterações</button>
+                <a class="btn" href="{url_for('entries')}?month_ref={month_ref}">Voltar para lançamentos</a>
+                <a class="btn btnDanger" href="{url_for('manual_delete', tx_id=tx_id)}">Excluir</a>
+              </div>
+            </form>
+          </div>
+
+          {err_block}
+          {msg_block}
+        </div>
+      </body>
+    </html>
+    """
+    return html
+
+@app.route("/manual/delete/<int:tx_id>", methods=["GET"])
+def manual_delete(tx_id: int):
+    profile = session.get("profile", "")
+    if not profile:
+        return redirect(url_for("home"))
+
+    tx = get_transaction(tx_id)
+    if not tx:
+        return "Lançamento não encontrado", 404
+
+    month_ref = tx["month_ref"]
+    ok, msg = delete_transaction(tx_id, profile)
+
+    if not ok:
+        return msg, 400
+
+    return redirect(url_for("entries", month_ref=month_ref))
 
 if __name__ == "__main__":
     import os
