@@ -100,7 +100,7 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # Imports (lotes)
+    # Cria imports (lotes)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS imports (
       batch_id TEXT PRIMARY KEY,
@@ -108,14 +108,57 @@ def init_db():
       uploaded_by TEXT NOT NULL,
       filename TEXT,
       row_count INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL,              -- 'preview' ou 'imported'
+      status TEXT NOT NULL,
       created_at TEXT NOT NULL
     )
     """)
 
-    # Transactions
+    # Detecta se transactions existe e se tem batch_id
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
+    exists = cur.fetchone() is not None
+
+    if not exists:
+        cur.execute("""
+        CREATE TABLE transactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          batch_id TEXT NOT NULL,
+          month_ref TEXT NOT NULL,
+          uploaded_by TEXT NOT NULL,
+          dt_text TEXT,
+          estabelecimento TEXT,
+          categoria TEXT,
+          valor REAL NOT NULL,
+          tipo TEXT NOT NULL,
+          dono TEXT NOT NULL,
+          rateio TEXT NOT NULL,
+          observacao TEXT,
+          parcela TEXT,
+          created_at TEXT NOT NULL
+        )
+        """)
+        conn.commit()
+        conn.close()
+        return
+
+    # Se existe, checa colunas
+    cur.execute("PRAGMA table_info(transactions)")
+    cols = [r[1] for r in cur.fetchall()]
+    has_batch_id = "batch_id" in cols
+
+    if has_batch_id:
+        conn.commit()
+        conn.close()
+        return
+
+    # Migração: tabela antiga sem batch_id
+    now = dt.datetime.utcnow().isoformat(timespec="seconds")
+
+    # Renomeia tabela antiga
+    cur.execute("ALTER TABLE transactions RENAME TO transactions_old")
+
+    # Cria tabela nova
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS transactions (
+    CREATE TABLE transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       batch_id TEXT NOT NULL,
       month_ref TEXT NOT NULL,
@@ -132,6 +175,36 @@ def init_db():
       created_at TEXT NOT NULL
     )
     """)
+
+    # Para cada mês e perfil antigos, cria um batch legacy importado e copia linhas
+    cur.execute("""
+      SELECT month_ref, uploaded_by, COUNT(*) as cnt
+      FROM transactions_old
+      GROUP BY month_ref, uploaded_by
+    """)
+    groups = cur.fetchall()
+
+    for g in groups:
+        month_ref = g[0]
+        uploaded_by = g[1]
+        cnt = int(g[2])
+        batch_id = uuid.uuid4().hex
+
+        cur.execute("""
+          INSERT INTO imports (batch_id, month_ref, uploaded_by, filename, row_count, status, created_at)
+          VALUES (?, ?, ?, ?, ?, 'imported', ?)
+        """, (batch_id, month_ref, uploaded_by, "legacy_migration", cnt, now))
+
+        cur.execute("""
+          INSERT INTO transactions
+          (batch_id, month_ref, uploaded_by, dt_text, estabelecimento, categoria, valor, tipo, dono, rateio, observacao, parcela, created_at)
+          SELECT ?, month_ref, uploaded_by, dt_text, estabelecimento, categoria, valor, tipo, dono, rateio, observacao, parcela, created_at
+          FROM transactions_old
+          WHERE month_ref = ? AND uploaded_by = ?
+        """, (batch_id, month_ref, uploaded_by))
+
+    # Drop tabela antiga
+    cur.execute("DROP TABLE transactions_old")
 
     conn.commit()
     conn.close()
